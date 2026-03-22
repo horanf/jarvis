@@ -153,6 +153,67 @@ fn parseStopReason(s: []const u8) prov.StopReason {
     return .unknown;
 }
 
+fn buildRequestBody(
+    self: *Anthropic,
+    allocator: std.mem.Allocator,
+    messages: []const session_mod.Message,
+    cwd: []const u8,
+) ![]const u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = buf.writer();
+
+    const system_prompt = try std.fmt.allocPrint(
+        allocator,
+        "You are a coding agent at {s}. Use bash to solve tasks. Act, don't explain.",
+        .{cwd},
+    );
+    defer allocator.free(system_prompt);
+
+    try w.writeByte('{');
+    try w.writeAll("\"model\":");
+    try std.json.stringify(self.model, .{}, w);
+    try w.writeAll(",\"system\":");
+    try std.json.stringify(system_prompt, .{}, w);
+    try w.writeAll(",\"messages\":");
+    try serializeMessages(messages, w);
+    try w.writeAll(",\"tools\":[{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}]");
+    try w.writeAll(",\"max_tokens\":8000,\"stream\":true}");
+
+    return buf.toOwnedSlice();
+}
+
+fn buildAssistantContentJson(
+    allocator: std.mem.Allocator,
+    state: *SseState,
+) ![]const u8 {
+    var buf = std.ArrayList(u8).init(allocator);
+    errdefer buf.deinit();
+    const w = buf.writer();
+    try w.writeByte('[');
+    var first = true;
+
+    if (state.accumulated_text.items.len > 0) {
+        first = false;
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.stringify(state.accumulated_text.items, .{}, w);
+        try w.writeByte('}');
+    }
+    for (state.tool_calls.items) |block| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"type\":\"tool_use\",\"id\":");
+        try std.json.stringify(block.id, .{}, w);
+        try w.writeAll(",\"name\":");
+        try std.json.stringify(block.name, .{}, w);
+        try w.writeAll(",\"input\":");
+        try w.writeAll(block.input_json);
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+    return buf.toOwnedSlice();
+}
+
 pub const Anthropic = struct {
     api_key:  []const u8,
     base_url: []const u8 = "https://api.anthropic.com",
@@ -164,12 +225,75 @@ pub const Anthropic = struct {
         messages: []const session_mod.Message,
         on_chunk: prov.StreamCallback,
     ) !prov.LlmResponse {
-        _ = self; _ = messages; _ = on_chunk;
-        log.debug("anthropic send (stub)", .{});
+        const cwd_buf = try std.process.getCwdAlloc(allocator);
+        defer allocator.free(cwd_buf);
+
+        const body = try buildRequestBody(self, allocator, messages, cwd_buf);
+        defer allocator.free(body);
+
+        const url = try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{self.base_url});
+        defer allocator.free(url);
+
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        const uri = try std.Uri.parse(url);
+        var server_header_buffer: [16 * 1024]u8 = undefined;
+        var req = try client.open(.POST, uri, .{
+            .server_header_buffer = &server_header_buffer,
+            .extra_headers = &.{
+                .{ .name = "content-type",      .value = "application/json" },
+                .{ .name = "x-api-key",         .value = self.api_key },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+            },
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = body.len };
+        try req.send();
+        try req.writeAll(body);
+        try req.finish();
+        try req.wait();
+
+        // Adapter: bridge public StreamCallback (1-arg) to internal SseCallback (2-arg)
+        const ChunkAdapter = struct {
+            public_cb: prov.StreamCallback,
+            fn forward(chunk: []const u8, ctx: *anyopaque) void {
+                const self2: *@This() = @ptrCast(@alignCast(ctx));
+                self2.public_cb(chunk);
+            }
+        };
+        var adapter = ChunkAdapter{ .public_cb = on_chunk };
+
+        var state = SseState.init(allocator);
+        errdefer state.deinit();
+
+        var buf_reader = std.io.bufferedReader(req.reader());
+        const reader = buf_reader.reader();
+        var line_buf: [64 * 1024]u8 = undefined;
+
+        while (try reader.readUntilDelimiterOrEof(&line_buf, '\n')) |raw_line| {
+            const line = std.mem.trimRight(u8, raw_line, "\r");
+            if (std.mem.startsWith(u8, line, "data: ")) {
+                const data = line[6..];
+                if (std.mem.eql(u8, data, "[DONE]")) break;
+                try processSseLine(data, &state, ChunkAdapter.forward, &adapter);
+            }
+        }
+
+        // Read stop_reason BEFORE deinit'ing state
+        const stop_reason = state.stop_reason;
+
+        const assistant_json = try buildAssistantContentJson(allocator, &state);
+        const tool_calls_slice = try state.tool_calls.toOwnedSlice();
+        // Clear tool_calls before deinit so deinit doesn't double-free
+        state.tool_calls = std.ArrayList(prov.ToolUseBlock).init(allocator);
+        state.deinit();
+
         return prov.LlmResponse{
-            .stop_reason            = .end_turn,
-            .tool_calls             = try allocator.alloc(prov.ToolUseBlock, 0),
-            .assistant_content_json = try allocator.dupe(u8, "[]"),
+            .stop_reason            = stop_reason,
+            .tool_calls             = tool_calls_slice,
+            .assistant_content_json = assistant_json,
             .allocator              = allocator,
         };
     }
