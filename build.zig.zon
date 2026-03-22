@@ -37,7 +37,8 @@
             .hash = "vaxis-0.5.1-BWNV_JJOCQAtdJyLvrYCKbKIhX9q3liQkKMAzujWS4HJ",
         },
         .anthropic = .{
-            .path = "../anthropic-sdk-zig",
+            .url = "git+https://github.com/horanf/anthropic-sdk-zig?ref=v0.2.4#4de0f21bb680d3a5d23426a0bd3ab42987f87eed",
+            .hash = "anthropic_sdk_zig-0.2.4-vkMC0WBTAQBj9_S2hSmMNJ5XghWRTzU5mfIxiBZ2yolB",
         },
     },
     .paths = .{

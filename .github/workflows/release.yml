@@ -1,0 +1,54 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload binaries to (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+            bin: jarvis
+            artifact: jarvis-macos-arm64
+
+          - os: macos-latest
+            target: x86_64-macos
+            bin: jarvis
+            artifact: jarvis-macos-x86_64
+
+          - os: windows-latest
+            target: x86_64-windows
+            bin: jarvis.exe
+            artifact: jarvis-windows-x86_64.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.15.2'
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Rename artifact
+        shell: bash
+        run: cp zig-out/bin/${{ matrix.bin }} ${{ matrix.artifact }}
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || inputs.tag }}
+          files: ${{ matrix.artifact }}
