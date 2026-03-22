@@ -7,7 +7,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const cfg = try Config.load(allocator);
+    var cfg = try Config.load(allocator);
+    defer cfg.deinit();
 
     var app = App.init(allocator, cfg);
     try app.run();

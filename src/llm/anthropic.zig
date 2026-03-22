@@ -1,152 +1,210 @@
 const std         = @import("std");
 const session_mod = @import("../core/session.zig");
 const prov        = @import("provider.zig");
+const sdk         = @import("anthropic");
 
 const log = std.log.scoped(.anthropic);
 
-fn serializeMessages(messages: []const session_mod.Message, allocator: std.mem.Allocator, writer: anytype) !void {
-    try writer.writeByte('[');
-    for (messages, 0..) |msg, i| {
-        if (i > 0) try writer.writeByte(',');
-        const role_str: []const u8 = switch (msg.role) {
-            .user      => "user",
-            .assistant => "assistant",
-            .system    => "system",
-        };
-        try writer.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
-        switch (msg.content_kind) {
-            .text => {
-                const escaped = try jsonEscape(allocator, msg.content);
-                defer allocator.free(escaped);
-                try writer.writeAll(escaped);
+pub const Anthropic = struct {
+    client: sdk.Client,
+    model:  []const u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        api_key:   []const u8,
+        base_url:  []const u8,
+        model:     []const u8,
+    ) !Anthropic {
+        const owned_model = try allocator.dupe(u8, model);
+        errdefer allocator.free(owned_model);
+        const client = try sdk.Client.init(allocator, .{
+            .api_key  = api_key,
+            .base_url = base_url,
+        });
+        return .{ .client = client, .model = owned_model };
+    }
+
+    pub fn deinit(self: *Anthropic) void {
+        const alloc = self.client.allocator;
+        self.client.deinit();
+        alloc.free(self.model);
+    }
+
+    pub fn send(
+        self:      *Anthropic,
+        allocator: std.mem.Allocator,
+        messages:  []const session_mod.Message,
+        on_chunk:  prov.StreamCallback,
+    ) !prov.LlmResponse {
+        // Convert session messages to SDK MessageParam.
+        // .text      → plain string content
+        // .json_array → raw JSON array embedded as-is
+        var sdk_msgs = try allocator.alloc(sdk.MessageParam, messages.len);
+        defer allocator.free(sdk_msgs);
+        for (messages, 0..) |msg, i| {
+            const role: sdk.Role = switch (msg.role) {
+                .user      => .user,
+                .assistant => .assistant,
+                .system    => .user, // system goes in top-level system field; shouldn't appear here
+            };
+            sdk_msgs[i] = switch (msg.content_kind) {
+                .text       => .{ .role = role, .content          = msg.content },
+                .json_array => .{ .role = role, .raw_content_json = msg.content },
+            };
+        }
+
+        // Build tool definition using an arena so the json.Value tree lives
+        // long enough for serialisation.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        var cmd_props = std.json.ObjectMap.init(aa);
+        try cmd_props.put("type", std.json.Value{ .string = "string" });
+        var properties = std.json.ObjectMap.init(aa);
+        try properties.put("command", std.json.Value{ .object = cmd_props });
+
+        const tools = [_]sdk.Tool{.{
+            .name        = "bash",
+            .description = "Run a shell command.",
+            .input_schema = .{
+                .type       = "object",
+                .properties = std.json.Value{ .object = properties },
+                .required   = &[_][]const u8{"command"},
             },
-            .json_array => try writer.writeAll(msg.content),
+        }};
+
+        // Build system prompt with current working directory.
+        const cwd = try std.process.getCwdAlloc(allocator);
+        defer allocator.free(cwd);
+        const system = try std.fmt.allocPrint(
+            allocator,
+            "You are a coding agent at {s}. Use bash to solve tasks. Act, don't explain.",
+            .{cwd},
+        );
+        defer allocator.free(system);
+
+        var result = try self.client.messages().stream(.{
+            .model      = self.model,
+            .max_tokens = 8000,
+            .messages   = sdk_msgs,
+            .tools      = &tools,
+            .system     = system,
+        });
+        defer result.deinit();
+
+        switch (result) {
+            .api_error => |*api_err| {
+                log.err("API error status={d}", .{api_err.statusCode()});
+                return error.ApiError;
+            },
+            .stream => |*stream| {
+                return try processStream(allocator, stream, on_chunk);
+            },
         }
-        try writer.writeByte('}');
-    }
-    try writer.writeByte(']');
-}
-
-// Internal two-arg callback (with context pointer) used by processSseLine.
-// The public StreamCallback (one-arg) is bridged in send() via a local adapter.
-const SseCallback = *const fn (chunk: []const u8, ctx: *anyopaque) void;
-
-pub const SseState = struct {
-    allocator:               std.mem.Allocator,
-    current_block_is_tool:   bool = false,
-    current_tool_id:         std.ArrayListUnmanaged(u8) = .empty,
-    current_tool_name:       std.ArrayListUnmanaged(u8) = .empty,
-    current_input_json:      std.ArrayListUnmanaged(u8) = .empty,
-    tool_calls:              std.ArrayListUnmanaged(prov.ToolUseBlock) = .empty,
-    accumulated_text:        std.ArrayListUnmanaged(u8) = .empty,
-    stop_reason:             prov.StopReason = .unknown,
-
-    pub fn init(allocator: std.mem.Allocator) SseState {
-        return .{
-            .allocator          = allocator,
-            .current_tool_id    = .empty,
-            .current_tool_name  = .empty,
-            .current_input_json = .empty,
-            .tool_calls         = .empty,
-            .accumulated_text   = .empty,
-        };
-    }
-
-    pub fn deinit(self: *SseState) void {
-        self.current_tool_id.deinit(self.allocator);
-        self.current_tool_name.deinit(self.allocator);
-        self.current_input_json.deinit(self.allocator);
-        for (self.tool_calls.items) |block| {
-            self.allocator.free(block.id);
-            self.allocator.free(block.name);
-            self.allocator.free(block.input_json);
-        }
-        self.tool_calls.deinit(self.allocator);
-        self.accumulated_text.deinit(self.allocator);
     }
 };
 
-pub fn processSseLine(
-    data:     []const u8,
-    state:    *SseState,
-    on_chunk: SseCallback,
-    ctx:      *anyopaque,
-) !void {
-    const parsed = std.json.parseFromSlice(
-        std.json.Value, state.allocator, data, .{},
-    ) catch return;
-    defer parsed.deinit();
+fn processStream(
+    allocator: std.mem.Allocator,
+    stream:    anytype,
+    on_chunk:  prov.StreamCallback,
+) !prov.LlmResponse {
+    var accumulated_text: std.ArrayListUnmanaged(u8) = .empty;
+    defer accumulated_text.deinit(allocator);
 
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else    => return,
+    var tool_calls: std.ArrayListUnmanaged(prov.ToolUseBlock) = .empty;
+    defer {
+        for (tool_calls.items) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.input_json);
+        }
+        tool_calls.deinit(allocator);
+    }
+
+    var current_tool_id:    std.ArrayListUnmanaged(u8) = .empty;
+    defer current_tool_id.deinit(allocator);
+    var current_tool_name:  std.ArrayListUnmanaged(u8) = .empty;
+    defer current_tool_name.deinit(allocator);
+    var current_input_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer current_input_json.deinit(allocator);
+
+    var current_block_is_tool = false;
+    var stop_reason: prov.StopReason = .unknown;
+
+    while (try stream.nextEvent()) |event| {
+        if (std.mem.eql(u8, event.event, "content_block_start")) {
+            const parsed = std.json.parseFromSlice(
+                sdk.StreamContentBlockStartEvent, allocator, event.data,
+                .{ .ignore_unknown_fields = true },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const block_type = parsed.value.content_block.type;
+            current_block_is_tool = std.mem.eql(u8, block_type, "tool_use");
+            current_tool_id.clearRetainingCapacity();
+            current_tool_name.clearRetainingCapacity();
+            current_input_json.clearRetainingCapacity();
+
+            if (current_block_is_tool) {
+                if (parsed.value.content_block.id)   |id|   try current_tool_id.appendSlice(allocator, id);
+                if (parsed.value.content_block.name) |name| try current_tool_name.appendSlice(allocator, name);
+            }
+        } else if (std.mem.eql(u8, event.event, "content_block_delta")) {
+            const parsed = std.json.parseFromSlice(
+                sdk.StreamContentBlockDeltaEvent, allocator, event.data,
+                .{ .ignore_unknown_fields = true },
+            ) catch continue;
+            defer parsed.deinit();
+
+            const dtype = parsed.value.delta.type;
+            if (std.mem.eql(u8, dtype, "text_delta")) {
+                if (parsed.value.delta.text) |text| {
+                    try accumulated_text.appendSlice(allocator, text);
+                    on_chunk(text);
+                }
+            } else if (std.mem.eql(u8, dtype, "input_json_delta")) {
+                if (parsed.value.delta.partial_json) |partial| {
+                    try current_input_json.appendSlice(allocator, partial);
+                }
+            }
+        } else if (std.mem.eql(u8, event.event, "content_block_stop")) {
+            if (current_block_is_tool and current_tool_id.items.len > 0) {
+                try tool_calls.append(allocator, .{
+                    .id         = try allocator.dupe(u8, current_tool_id.items),
+                    .name       = try allocator.dupe(u8, current_tool_name.items),
+                    .input_json = try allocator.dupe(u8, current_input_json.items),
+                });
+                current_block_is_tool = false;
+            }
+        } else if (std.mem.eql(u8, event.event, "message_delta")) {
+            const parsed = std.json.parseFromSlice(
+                sdk.StreamMessageDeltaEvent, allocator, event.data,
+                .{ .ignore_unknown_fields = true },
+            ) catch continue;
+            defer parsed.deinit();
+
+            if (parsed.value.delta.stop_reason) |sr| {
+                stop_reason = parseStopReason(sr);
+            }
+        } else if (std.mem.eql(u8, event.event, "message_stop")) {
+            break;
+        }
+    }
+
+    const assistant_json = try buildAssistantContentJson(
+        allocator, accumulated_text.items, tool_calls.items,
+    );
+    const tool_calls_slice = try tool_calls.toOwnedSlice(allocator);
+    tool_calls = .empty; // prevent double-free in defer above
+
+    return prov.LlmResponse{
+        .stop_reason            = stop_reason,
+        .tool_calls             = tool_calls_slice,
+        .assistant_content_json = assistant_json,
+        .allocator              = allocator,
     };
-    const event_type: []const u8 = switch (obj.get("type") orelse return) {
-        .string => |s| s,
-        else    => return,
-    };
-
-    if (std.mem.eql(u8, event_type, "content_block_start")) {
-        const cb_obj = switch (obj.get("content_block") orelse return) {
-            .object => |o| o, else => return,
-        };
-        const block_type: []const u8 = switch (cb_obj.get("type") orelse return) {
-            .string => |s| s, else => return,
-        };
-        state.current_block_is_tool = std.mem.eql(u8, block_type, "tool_use");
-        state.current_tool_id.clearRetainingCapacity();
-        state.current_tool_name.clearRetainingCapacity();
-        state.current_input_json.clearRetainingCapacity();
-        if (state.current_block_is_tool) {
-            if (cb_obj.get("id"))   |v| if (v == .string) try state.current_tool_id.appendSlice(state.allocator, v.string);
-            if (cb_obj.get("name")) |v| if (v == .string) try state.current_tool_name.appendSlice(state.allocator, v.string);
-        }
-        return;
-    }
-
-    if (std.mem.eql(u8, event_type, "content_block_delta")) {
-        const delta = switch (obj.get("delta") orelse return) {
-            .object => |o| o, else => return,
-        };
-        const dtype: []const u8 = switch (delta.get("type") orelse return) {
-            .string => |s| s, else => return,
-        };
-        if (std.mem.eql(u8, dtype, "text_delta")) {
-            const text: []const u8 = switch (delta.get("text") orelse return) {
-                .string => |s| s, else => return,
-            };
-            try state.accumulated_text.appendSlice(state.allocator, text);
-            on_chunk(text, ctx);
-        } else if (std.mem.eql(u8, dtype, "input_json_delta")) {
-            const partial: []const u8 = switch (delta.get("partial_json") orelse return) {
-                .string => |s| s, else => return,
-            };
-            try state.current_input_json.appendSlice(state.allocator, partial);
-        }
-        return;
-    }
-
-    if (std.mem.eql(u8, event_type, "content_block_stop")) {
-        if (state.current_block_is_tool) {
-            try state.tool_calls.append(state.allocator, .{
-                .id         = try state.allocator.dupe(u8, state.current_tool_id.items),
-                .name       = try state.allocator.dupe(u8, state.current_tool_name.items),
-                .input_json = try state.allocator.dupe(u8, state.current_input_json.items),
-            });
-        }
-        return;
-    }
-
-    if (std.mem.eql(u8, event_type, "message_delta")) {
-        const delta = switch (obj.get("delta") orelse return) {
-            .object => |o| o, else => return,
-        };
-        const sr: []const u8 = switch (delta.get("stop_reason") orelse return) {
-            .string => |s| s, else => return,
-        };
-        state.stop_reason = parseStopReason(sr);
-        return;
-    }
 }
 
 fn parseStopReason(s: []const u8) prov.StopReason {
@@ -157,296 +215,74 @@ fn parseStopReason(s: []const u8) prov.StopReason {
     return .unknown;
 }
 
-fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-    // Simple JSON string escape: only handles quotes and backslashes for now
-    var count: usize = 0;
-    for (s) |c| {
-        if (c == '"' or c == '\\' or c == '\n' or c == '\r' or c == '\t') count += 1;
-    }
-    if (count == 0) return try std.fmt.allocPrint(allocator, "\"{s}\"", .{s});
-
-    var result = try allocator.alloc(u8, s.len + count + 2); // +2 for quotes
-    result[0] = '"';
-    var i: usize = 1;
-    for (s) |c| {
-        switch (c) {
-            '"' => { result[i] = '\\'; result[i+1] = '"'; i += 2; },
-            '\\' => { result[i] = '\\'; result[i+1] = '\\'; i += 2; },
-            '\n' => { result[i] = '\\'; result[i+1] = 'n'; i += 2; },
-            '\r' => { result[i] = '\\'; result[i+1] = 'r'; i += 2; },
-            '\t' => { result[i] = '\\'; result[i+1] = 't'; i += 2; },
-            else => { result[i] = c; i += 1; },
-        }
-    }
-    result[i] = '"';
-    return result[0..i+1];
-}
-
-fn buildRequestBody(
-    self: *Anthropic,
-    allocator: std.mem.Allocator,
-    messages: []const session_mod.Message,
-    cwd: []const u8,
-) ![]const u8 {
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-
-    const system_prompt = try std.fmt.allocPrint(
-        allocator,
-        "You are a coding agent at {s}. Use bash to solve tasks. Act, don't explain.",
-        .{cwd},
-    );
-    defer allocator.free(system_prompt);
-
-    const model_escaped = try jsonEscape(allocator, self.model);
-    defer allocator.free(model_escaped);
-    const system_escaped = try jsonEscape(allocator, system_prompt);
-    defer allocator.free(system_escaped);
-
-    try w.writeByte('{');
-    try w.writeAll("\"model\":");
-    try w.writeAll(model_escaped);
-    try w.writeAll(",\"system\":");
-    try w.writeAll(system_escaped);
-    try w.writeAll(",\"messages\":");
-    try serializeMessages(messages, allocator, w);
-    try w.writeAll(",\"tools\":[{\"name\":\"bash\",\"description\":\"Run a shell command.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"}},\"required\":[\"command\"]}}]");
-    try w.writeAll(",\"max_tokens\":8000,\"stream\":true}");
-
-    return buf.toOwnedSlice(allocator);
-}
-
 fn buildAssistantContentJson(
-    allocator: std.mem.Allocator,
-    state: *SseState,
+    allocator:  std.mem.Allocator,
+    text:       []const u8,
+    tool_calls: []const prov.ToolUseBlock,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buf.deinit(allocator);
+    defer buf.deinit(allocator);
     const w = buf.writer(allocator);
+
     try w.writeByte('[');
     var first = true;
 
-    if (state.accumulated_text.items.len > 0) {
+    if (text.len > 0) {
         first = false;
         try w.writeAll("{\"type\":\"text\",\"text\":");
-        const text_escaped = try jsonEscape(allocator, state.accumulated_text.items);
-        defer allocator.free(text_escaped);
-        try w.writeAll(text_escaped);
+        try writeJsonString(w, text);
         try w.writeByte('}');
     }
-    for (state.tool_calls.items) |block| {
+    for (tool_calls) |tc| {
         if (!first) try w.writeByte(',');
         first = false;
         try w.writeAll("{\"type\":\"tool_use\",\"id\":");
-        const id_escaped = try jsonEscape(allocator, block.id);
-        defer allocator.free(id_escaped);
-        try w.writeAll(id_escaped);
+        try writeJsonString(w, tc.id);
         try w.writeAll(",\"name\":");
-        const name_escaped = try jsonEscape(allocator, block.name);
-        defer allocator.free(name_escaped);
-        try w.writeAll(name_escaped);
+        try writeJsonString(w, tc.name);
         try w.writeAll(",\"input\":");
-        try w.writeAll(block.input_json);
+        try w.writeAll(tc.input_json);
         try w.writeByte('}');
     }
     try w.writeByte(']');
     return buf.toOwnedSlice(allocator);
 }
 
-pub const Anthropic = struct {
-    api_key:  []const u8,
-    base_url: []const u8 = "https://api.anthropic.com",
-    model:    []const u8,
-
-    pub fn send(
-        self: *Anthropic,
-        allocator: std.mem.Allocator,
-        messages: []const session_mod.Message,
-        on_chunk: prov.StreamCallback,
-    ) !prov.LlmResponse {
-        const cwd_buf = try std.process.getCwdAlloc(allocator);
-        defer allocator.free(cwd_buf);
-
-        const body = try buildRequestBody(self, allocator, messages, cwd_buf);
-        defer allocator.free(body);
-
-        const url = try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{self.base_url});
-        defer allocator.free(url);
-
-        // Zig 0.15.2 HTTP Client implementation
-        var client = std.http.Client{ .allocator = allocator };
-        defer client.deinit();
-
-        const uri = try std.Uri.parse(url);
-        var req = try client.request(.POST, uri, .{
-            .extra_headers = &.{
-                .{ .name = "content-type",      .value = "application/json" },
-                .{ .name = "x-api-key",         .value = self.api_key },
-                .{ .name = "anthropic-version", .value = "2023-06-01" },
-            },
-        });
-        defer req.deinit();
-
-        req.transfer_encoding = .{ .content_length = body.len };
-        var body_writer = try req.sendBodyUnflushed(&.{});
-        try body_writer.writer.writeAll(body);
-        try body_writer.end();
-        try req.connection.?.flush();
-
-        var redirect_buffer: [8 * 1024]u8 = undefined;
-        var response = try req.receiveHead(&redirect_buffer);
-
-        // Adapter: bridge public StreamCallback (1-arg) to internal SseCallback (2-arg)
-        const ChunkAdapter = struct {
-            public_cb: prov.StreamCallback,
-            fn forward(chunk: []const u8, ctx: *anyopaque) void {
-                const self2: *@This() = @ptrCast(@alignCast(ctx));
-                self2.public_cb(chunk);
-            }
-        };
-        var adapter = ChunkAdapter{ .public_cb = on_chunk };
-
-        var state = SseState.init(allocator);
-        errdefer state.deinit();
-
-        // Read SSE stream
-        var transfer_buffer: [64 * 1024]u8 = undefined;
-        var reader = response.reader(&transfer_buffer);
-        var line_buf: [64 * 1024]u8 = undefined;
-        var line_pos: usize = 0;
-
-        while (true) {
-            var byte_buf: [1]u8 = undefined;
-            var vecs = [_][]u8{&byte_buf};
-            const n = reader.readVec(&vecs) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => |e| return e,
-            };
-            if (n == 0) break;
-            const byte = byte_buf[0];
-
-            if (byte == '\n') {
-                const line = std.mem.trimRight(u8, line_buf[0..line_pos], "\r");
-                if (std.mem.startsWith(u8, line, "data: ")) {
-                    const data = line[6..];
-                    if (std.mem.eql(u8, data, "[DONE]")) break;
-                    try processSseLine(data, &state, ChunkAdapter.forward, &adapter);
-                }
-                line_pos = 0;
-            } else if (line_pos < line_buf.len) {
-                line_buf[line_pos] = byte;
-                line_pos += 1;
-            }
+fn writeJsonString(writer: anytype, s: []const u8) !void {
+    try writer.writeByte('"');
+    for (s) |c| {
+        switch (c) {
+            '"'  => try writer.writeAll("\\\""),
+            '\\' => try writer.writeAll("\\\\"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            '\t' => try writer.writeAll("\\t"),
+            else => try writer.writeByte(c),
         }
-
-        // Read stop_reason BEFORE deinit'ing state
-        const stop_reason = state.stop_reason;
-
-        const assistant_json = try buildAssistantContentJson(allocator, &state);
-        const tool_calls_slice = try state.tool_calls.toOwnedSlice(allocator);
-        // Clear tool_calls before deinit so deinit doesn't double-free
-        state.tool_calls = .empty;
-        state.deinit();
-
-        return prov.LlmResponse{
-            .stop_reason            = stop_reason,
-            .tool_calls             = tool_calls_slice,
-            .assistant_content_json = assistant_json,
-            .allocator              = allocator,
-        };
     }
-};
-
-test "serializeMessages: text message" {
-    const msgs = &[_]session_mod.Message{
-        .{ .role = .user, .content = "hello world", .content_kind = .text },
-    };
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(std.testing.allocator);
-    try serializeMessages(msgs, std.testing.allocator, buf.writer(std.testing.allocator));
-    try std.testing.expectEqualStrings(
-        \\[{"role":"user","content":"hello world"}]
-    , buf.items);
+    try writer.writeByte('"');
 }
 
-test "serializeMessages: json_array message" {
-    const msgs = &[_]session_mod.Message{
-        .{
-            .role         = .assistant,
-            .content      = "[{\"type\":\"text\",\"text\":\"hi\"}]",
-            .content_kind = .json_array,
-        },
-    };
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(std.testing.allocator);
-    try serializeMessages(msgs, std.testing.allocator, buf.writer(std.testing.allocator));
-    try std.testing.expectEqualStrings(
-        \\[{"role":"assistant","content":[{"type":"text","text":"hi"}]}]
-    , buf.items);
+const testing = std.testing;
+
+test "parseStopReason" {
+    try testing.expectEqual(prov.StopReason.end_turn, parseStopReason("end_turn"));
+    try testing.expectEqual(prov.StopReason.tool_use, parseStopReason("tool_use"));
+    try testing.expectEqual(prov.StopReason.unknown,  parseStopReason("invalid"));
 }
 
-test "SSE: text_delta calls callback" {
-    const Collector = struct {
-        buf: std.ArrayListUnmanaged(u8) = .empty,
-        fn cb(chunk: []const u8, ctx: *anyopaque) void {
-            var self: *@This() = @ptrCast(@alignCast(ctx));
-            self.buf.appendSlice(std.testing.allocator, chunk) catch {};
-        }
-    };
-    var collector = Collector{ .buf = .empty };
-    defer collector.buf.deinit(std.testing.allocator);
-
-    var state = SseState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try processSseLine(
-        \\{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}
-    , &state, Collector.cb, &collector);
-    try processSseLine(
-        \\{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}
-    , &state, Collector.cb, &collector);
-
-    try std.testing.expectEqualStrings("hello", collector.buf.items);
+test "buildAssistantContentJson with text only" {
+    const json = try buildAssistantContentJson(testing.allocator, "hello", &.{});
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"hello\"}]", json);
 }
 
-test "SSE: tool_use block is captured" {
-    const noop = struct {
-        fn cb(_: []const u8, _: *anyopaque) void {}
+test "buildAssistantContentJson with tool call" {
+    const tool_calls = &[_]prov.ToolUseBlock{
+        .{ .id = "tc1", .name = "bash", .input_json = "{\"cmd\":\"ls\"}" },
     };
-    var dummy: u8 = 0;
-
-    var state = SseState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try processSseLine(
-        \\{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_123\",\"name\":\"bash\",\"input\":{}}}
-    , &state, noop.cb, &dummy);
-    try processSseLine(
-        \\{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls\\\"}\"}}
-    , &state, noop.cb, &dummy);
-    try processSseLine(
-        \\{\"type\":\"content_block_stop\",\"index\":1}
-    , &state, noop.cb, &dummy);
-
-    try std.testing.expectEqual(@as(usize, 1), state.tool_calls.items.len);
-    try std.testing.expectEqualStrings("tool_123", state.tool_calls.items[0].id);
-    try std.testing.expectEqualStrings("bash",     state.tool_calls.items[0].name);
-    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", state.tool_calls.items[0].input_json);
-}
-
-test "SSE: stop_reason from message_delta" {
-    const noop = struct {
-        fn cb(_: []const u8, _: *anyopaque) void {}
-    };
-    var dummy: u8 = 0;
-
-    var state = SseState.init(std.testing.allocator);
-    defer state.deinit();
-
-    try processSseLine(
-        \\{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":42}}
-    , &state, noop.cb, &dummy);
-
-    try std.testing.expectEqual(prov.StopReason.tool_use, state.stop_reason);
+    const json = try buildAssistantContentJson(testing.allocator, "", tool_calls);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_use\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"id\":\"tc1\"") != null);
 }

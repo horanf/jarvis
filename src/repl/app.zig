@@ -3,6 +3,7 @@ const session_mod = @import("../core/session.zig");
 const prov        = @import("../llm/provider.zig");
 const registry    = @import("../tools/registry.zig");
 const config_mod  = @import("../config.zig");
+const anthropic   = @import("../llm/anthropic.zig");
 
 const log = std.log.scoped(.repl);
 
@@ -84,7 +85,11 @@ fn agentLoop(
         if (response.stop_reason != .tool_use) break;
 
         var results = try allocator.alloc(registry.ToolResult, response.tool_calls.len);
-        defer allocator.free(results);
+        var results_filled: usize = 0;
+        defer {
+            for (results[0..results_filled]) |r| allocator.free(r.output);
+            allocator.free(results);
+        }
 
         for (response.tool_calls, 0..) |tc, idx| {
             const display = tc.input_json[0..@min(tc.input_json.len, 200)];
@@ -102,6 +107,7 @@ fn agentLoop(
                 .input = parsed.value,
             });
             results[idx] = result;
+            results_filled += 1;
 
             const preview = result.output[0..@min(result.output.len, 200)];
             const out_line = try std.fmt.allocPrint(allocator, "{s}\n", .{preview});
@@ -129,12 +135,17 @@ pub const App = struct {
             return;
         };
 
+        // 初始化 anthropic 客户端
+        var anthro_client = try anthropic.Anthropic.init(
+            self.allocator,
+            anthro_cfg.api_key,
+            anthro_cfg.base_url,
+            anthro_cfg.model,
+        );
+        defer anthro_client.deinit();
+
         var provider = prov.Provider{
-            .anthropic = .{
-                .api_key  = anthro_cfg.api_key,
-                .base_url = anthro_cfg.base_url,
-                .model    = anthro_cfg.model,
-            },
+            .anthropic = anthro_client,
         };
 
         var sess = session_mod.Session.init(self.allocator);
@@ -157,9 +168,7 @@ pub const App = struct {
             if (trimmed.len == 0) continue;
             if (std.mem.eql(u8, trimmed, "q") or std.mem.eql(u8, trimmed, "exit")) break;
 
-            const owned = try self.allocator.dupe(u8, trimmed);
-            defer self.allocator.free(owned);
-            try sess.append(.user, owned, .text);
+            try sess.append(.user, trimmed, .text);
 
             try writeAll(std.posix.STDOUT_FILENO, "\n");
             agentLoop(self.allocator, &sess, &provider) catch |err| {

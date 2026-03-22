@@ -33,6 +33,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const anthropic = b.dependency("anthropic", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("jarvis", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -72,6 +77,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "jarvis", .module = mod },
                 .{ .name = "vaxis", .module = vaxis.module("vaxis") },
+                .{ .name = "anthropic", .module = anthropic.module("anthropic_sdk_zig") },
             },
         }),
     });
