@@ -58,43 +58,121 @@ pub const Message = struct {
 };
 ```
 
-- `text`: plain string content (existing behavior)
+- `text`: plain string content (existing behavior, default)
 - `json_array`: pre-serialized JSON array string, embedded as-is in HTTP body
 
-### `src/llm/provider.zig` — Extended Return Type
-
-New types:
+Update `Session.append` to accept `content_kind`:
 
 ```zig
-pub const ToolUseBlock = struct {
-    id: []const u8,         // used to build tool_result
-    name: []const u8,       // e.g. "bash"
-    input_json: []const u8, // raw JSON: {"command":"ls"}
-};
+pub fn append(
+    self: *Session,
+    role: Role,
+    content: []const u8,
+    content_kind: ContentKind,
+) !void
+```
 
-pub const StopReason = enum { end_turn, tool_use, max_tokens };
+Existing call sites pass `.text` explicitly.
 
-pub const LlmResponse = struct {
-    stop_reason: StopReason,
-    tool_calls: []ToolUseBlock,
-    allocator: std.mem.Allocator,
+### `src/config.zig` — Add `base_url`
 
-    pub fn deinit(self: *LlmResponse) void;
+Extend `AnthropicConfig` with a `base_url` field:
+
+```zig
+pub const AnthropicConfig = struct {
+    api_key: []const u8,
+    base_url: []const u8 = "https://api.anthropic.com",
+    model: []const u8 = "claude-opus-4-5",
 };
 ```
 
-Updated `send` signature:
+`Config.load` reads environment variables:
 
 ```zig
+pub fn load(allocator: std.mem.Allocator) !Config {
+    _ = allocator;
+    return Config{
+        .anthropic = AnthropicConfig{
+            .api_key   = std.posix.getenv("ANTHROPIC_API_KEY")  orelse "",
+            .base_url  = std.posix.getenv("ANTHROPIC_BASE_URL") orelse "https://api.anthropic.com",
+            .model     = std.posix.getenv("MODEL_ID")           orelse "claude-opus-4-5",
+        },
+    };
+}
+```
+
+### `src/llm/provider.zig` — Extended Return Type
+
+New types (single authoritative definition):
+
+```zig
+pub const ToolUseBlock = struct {
+    id: []const u8,              // owned (allocator.dupe'd during SSE parse)
+    name: []const u8,            // owned (allocator.dupe'd during SSE parse)
+    input_json: []const u8,      // owned (allocator.dupe'd during SSE parse)
+};
+
+pub const StopReason = enum {
+    end_turn,
+    tool_use,
+    max_tokens,
+    stop_sequence,
+    unknown,        // catch-all for unrecognised values
+};
+
+pub const LlmResponse = struct {
+    stop_reason: StopReason,
+    tool_calls: []ToolUseBlock,        // slice owned by this struct
+    assistant_content_json: []const u8, // owned; full assistant content array JSON
+    allocator: std.mem.Allocator,
+
+    /// Frees all owned memory.
+    pub fn deinit(self: *LlmResponse) void {
+        for (self.tool_calls) |block| {
+            self.allocator.free(block.id);
+            self.allocator.free(block.name);
+            self.allocator.free(block.input_json);
+        }
+        self.allocator.free(self.tool_calls);
+        self.allocator.free(self.assistant_content_json);
+    }
+};
+```
+
+**Memory ownership rule**: all `[]const u8` fields in `ToolUseBlock` and
+`assistant_content_json` are `allocator.dupe`'d copies. Caller owns `LlmResponse`
+and must call `deinit` when done.
+
+Updated `Provider` union wrapper and inner-struct signature (both must return `!LlmResponse`):
+
+```zig
+// Provider union wrapper in provider.zig:
 pub fn send(
     self: *Provider,
     allocator: std.mem.Allocator,
     messages: []const session.Message,
     on_chunk: StreamCallback,
-) !LlmResponse
+) !LlmResponse {
+    return switch (self.*) {
+        inline else => |*p| try p.send(allocator, messages, on_chunk),
+    };
+}
 ```
 
-`on_chunk` is called for each streamed text delta (for display). `LlmResponse` carries `stop_reason` and any `tool_use` blocks.
+`openai.zig` stub:
+
+```zig
+pub fn send(self: *OpenAI, allocator: std.mem.Allocator,
+            messages: []const session.Message, on_chunk: StreamCallback) !LlmResponse {
+    _ = self; _ = messages; _ = on_chunk;
+    return LlmResponse{
+        .stop_reason             = .end_turn,
+        .tool_calls              = try allocator.alloc(ToolUseBlock, 0),
+        .assistant_content_json  = try allocator.dupe(u8, "[]"),
+        .allocator               = allocator,
+    };
+}
+```
 
 ---
 
@@ -103,21 +181,31 @@ pub fn send(
 ### Request
 
 ```
-POST {ANTHROPIC_BASE_URL}/v1/messages
+POST {base_url}/v1/messages
 Headers:
   x-api-key: {api_key}
   anthropic-version: 2023-06-01
   content-type: application/json
 Body:
   {
-    "model": "{MODEL_ID}",
-    "system": "You are a coding agent at {cwd}. Use bash to solve tasks.",
+    "model": "{model}",
+    "system": "You are a coding agent at {cwd}. Use bash to solve tasks. Act, don't explain.",
     "messages": [...],
-    "tools": [{ "name": "bash", "description": "...", "input_schema": {...} }],
+    "tools": [{
+      "name": "bash",
+      "description": "Run a shell command.",
+      "input_schema": {
+        "type": "object",
+        "properties": { "command": { "type": "string" } },
+        "required": ["command"]
+      }
+    }],
     "max_tokens": 8000,
     "stream": true
   }
 ```
+
+Config values come from `AnthropicConfig` (passed from `main` via `App`).
 
 ### Message Serialization
 
@@ -126,24 +214,36 @@ Body:
 
 ### SSE Stream Parsing
 
-Read response body line by line. Lines starting with `data: ` carry JSON payloads:
+Use `std.io.bufferedReader` wrapping the HTTP response reader, with
+`readUntilDelimiterOrEof` on `\n` to handle TCP fragmentation.
 
-| Event type | Action |
-|------------|--------|
-| `content_block_start` with `type=tool_use` | Record `id`, `name`; start accumulating `input_json` |
-| `content_block_delta` with `type=text_delta` | Call `on_chunk(delta.text)` |
-| `content_block_delta` with `type=input_json_delta` | Append to `input_json` buffer |
-| `content_block_stop` | Finalize current block |
-| `message_delta` | Capture `stop_reason` |
-| `message_stop` | Break loop, return `LlmResponse` |
+Lines starting with `data: ` carry JSON payloads. Maintain state variable
+`current_block_is_tool_use: bool` to track the active block type.
 
-### Environment Variables
+| Event type | Condition | Action |
+|------------|-----------|--------|
+| `content_block_start` | `block.type == "tool_use"` | Set `current_block_is_tool_use = true`; dupe `id` and `name`; init empty `input_json` ArrayList |
+| `content_block_start` | `block.type == "text"` | Set `current_block_is_tool_use = false`; init empty `text` ArrayList |
+| `content_block_delta` | `delta.type == "text_delta"` | Call `on_chunk(delta.text)`; append to `text` ArrayList |
+| `content_block_delta` | `delta.type == "input_json_delta"` | Append to `input_json` ArrayList |
+| `content_block_stop` | `current_block_is_tool_use == true` | Finalize: dupe `input_json.items`, append `ToolUseBlock` to tool_calls list |
+| `content_block_stop` | `current_block_is_tool_use == false` | Finalize: dupe `text.items` for accumulated text content |
+| `message_delta` | — | Capture `stop_reason` string; map to `StopReason` enum (unknown string → `.unknown`) |
+| `message_stop` | — | Break loop |
 
-| Variable | Usage |
-|----------|-------|
-| `ANTHROPIC_BASE_URL` | Base URL (e.g. kimi endpoint) |
-| `ANTHROPIC_API_KEY` | API key header |
-| `MODEL_ID` | Model identifier |
+### Building `assistant_content_json`
+
+After stream ends, build the full assistant content JSON array for history:
+
+```json
+[
+  {"type": "text", "text": "...accumulated text..."},
+  {"type": "tool_use", "id": "...", "name": "bash", "input": {"command": "..."}}
+]
+```
+
+If no text was accumulated, omit the text block. Serialize and `allocator.dupe` the result
+into `LlmResponse.assistant_content_json`.
 
 ---
 
@@ -151,52 +251,91 @@ Read response body line by line. Lines starting with `data: ` carry JSON payload
 
 ### `src/tools/shell.zig`
 
+Tool name dispatched as `"bash"` (matching Anthropic tool definition).
+
 ```
 run(allocator, input: std.json.Value) !ToolResult
   1. Extract "command" field from input JSON
   2. Check against DANGEROUS list:
        ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-     → return error ToolResult if matched
-  3. std.process.Child("sh", &["-c", command])
-     timeout: 120s
-  4. Collect stdout + stderr, truncate to 50000 bytes
-  5. Return ToolResult{ .output = combined, .is_error = exit_code != 0 }
+     → return ToolResult{ .output="Error: Dangerous command blocked", .is_error=true }
+  3. std.process.Child with argv = &[_][]const u8{ "sh", "-c", command }
+     stdout and stderr both captured (pipe)
+     timeout: 120s (TODO: kill child after 120s; stub acceptable for initial impl)
+  4. Collect stdout + stderr (concatenated), truncate to 50000 bytes
+  5. Return ToolResult{ .output = combined, .is_error = (exit_code != 0) }
 ```
+
+### `src/tools/registry.zig` — Tool Name Change
+
+Update dispatch condition from `"shell"` to `"bash"`:
+
+```zig
+if (std.mem.eql(u8, call.name, "bash")) {
+    return @import("shell.zig").run(allocator, call.input);
+}
+```
+
+### tool_result JSON Format
+
+```json
+[
+  {
+    "type": "tool_result",
+    "tool_use_id": "<id from ToolUseBlock.id>",
+    "content": "<output string>",
+    "is_error": true
+  }
+]
+```
+
+`is_error` may be omitted or set to `false` when `ToolResult.is_error == false`; both
+are valid per the Anthropic API. Implementations may include it unconditionally for
+simplicity.
+
+If multiple tool calls exist in one turn, all results appear in the same array.
 
 ### `src/repl/app.zig` — Agent Loop
 
-Mirrors Python `agent_loop()`:
-
 ```
 App.run():
-  load config (ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY, MODEL_ID)
-  history = []Message
+  load Config (reads env vars)
+  build Provider (.anthropic)
+  var session = Session.init(allocator)
+  defer session.deinit()
 
-  loop:
-    print "jarvis >> ", read line from stdin
-    if EOF or "q"/"exit" → break
-    append Message{ .role=.user, .content=line, .content_kind=.text }
+  loop (REPL):
+    print "\x1b[36mjarvis >> \x1b[0m", read line from stdin
+    if EOF or "q"/"exit"/"" → break
+    session.append(.user, line, .text)
 
-    agent_loop(history):
+    agent_loop(&session, &provider):
       while true:
-        response = provider.send(history, on_chunk=printYellow)
-        // append assistant text to history
+        var response = try provider.send(allocator, session.messages.items, printChunk)
+        defer response.deinit()
+
+        // Append full assistant content array to history
+        try session.append(.assistant, response.assistant_content_json, .json_array)
 
         if response.stop_reason != .tool_use → break
 
-        tool_results = []
-        for each tool_call in response.tool_calls:
-          print command in yellow
-          result = tools.dispatch(tool_call.name, tool_call.input_json)
-          print first 200 chars of result
-          tool_results.append(tool_result JSON)
+        // Execute each tool call
+        var results_json = try buildToolResultsJson(allocator, response.tool_calls)
+        defer allocator.free(results_json)
 
-        // serialize tool_results to JSON array string
-        append Message{
-          .role = .user,
-          .content = serialized_json,
-          .content_kind = .json_array,
-        }
+        for each tool_call in response.tool_calls:
+          print "\x1b[33m$ {command}\x1b[0m"
+          result = tools.dispatch(allocator, ToolCall{.name=tool_call.name, ...})
+          print result.output[0..min(200, len)]
+
+        try session.append(.user, results_json, .json_array)
+
+buildToolResultsJson(allocator, tool_calls, results) []const u8:
+  serialize to JSON array (see format above)
+  return allocator.dupe'd result
+
+printChunk(chunk: []const u8) void:
+  write chunk to stdout
 ```
 
 ---
@@ -205,13 +344,14 @@ App.run():
 
 | File | Change |
 |------|--------|
-| `src/core/session.zig` | Add `ContentKind`, extend `Message` |
+| `src/core/session.zig` | Add `ContentKind`; extend `Message`; update `Session.append` |
+| `src/config.zig` | Add `base_url` to `AnthropicConfig`; read env vars in `Config.load` |
 | `src/llm/provider.zig` | Add `ToolUseBlock`, `StopReason`, `LlmResponse`; update `send()` signature |
-| `src/llm/anthropic.zig` | Implement HTTP POST + SSE parsing |
-| `src/tools/shell.zig` | Implement bash execution |
+| `src/llm/anthropic.zig` | Implement HTTP POST + SSE parsing + response serialization |
+| `src/llm/openai.zig` | Update `send()` signature; return stub `LlmResponse` (4 fields) |
+| `src/tools/shell.zig` | Implement bash execution with dangerous-command blocking |
+| `src/tools/registry.zig` | Rename dispatch key from `"shell"` to `"bash"` |
 | `src/repl/app.zig` | Implement REPL + agent loop |
-
-`src/config.zig`, `src/tools/registry.zig`, `src/llm/openai.zig` unchanged.
 
 ---
 
@@ -219,7 +359,8 @@ App.run():
 
 Per CLAUDE.md TDD convention — test blocks written before implementation:
 
-- `session.zig`: test `content_kind` default; test `json_array` message append
-- `shell.zig`: test dangerous command blocking; test successful command output
-- `anthropic.zig`: test message serialization (text vs json_array); test SSE line parsing
-- `repl/app.zig`: test agent loop with mock provider returning `.tool_use` then `.end_turn`
+- `session.zig`: `content_kind` default is `.text`; `append` with `.json_array` stores correctly
+- `shell.zig`: dangerous command returns `is_error=true`; successful command returns stdout
+- `anthropic.zig`: message serialization (`.text` vs `.json_array`); SSE line parser with sample event data; `LlmResponse.deinit` with `std.testing.allocator` (no leak)
+- `registry.zig`: `"bash"` dispatches to `shell.run`; unknown name returns `is_error=true`
+- `repl/app.zig`: agent loop with mock provider: first call returns `.tool_use`, second returns `.end_turn`; verify session message count
