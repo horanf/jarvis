@@ -8,8 +8,7 @@ pub fn main() !void {
     const allocator = gpa.allocator();
 
     const cfg = try Config.load(allocator);
-    _ = cfg;
 
-    var app = App.init(allocator);
+    var app = App.init(allocator, cfg);
     try app.run();
 }
