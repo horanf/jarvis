@@ -47,8 +47,11 @@ pub const Config = struct {
         // Parse .env into a map (key → owned value).
         var env_map = std.StringHashMap([]u8).init(allocator);
         defer {
-            var it = env_map.valueIterator();
-            while (it.next()) |v| allocator.free(v.*);
+            var it = env_map.iterator();
+            while (it.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                allocator.free(entry.value_ptr.*);
+            }
             env_map.deinit();
         }
         loadDotEnv(allocator, &env_map) catch |err| {
@@ -78,7 +81,10 @@ fn dupeEnv(
     default:   []const u8,
     env_map:   *std.StringHashMap([]u8),
 ) ![]u8 {
-    if (std.posix.getenv(key)) |v| return allocator.dupe(u8, v);
+    if (std.process.getEnvVarOwned(allocator, key)) |value| return value else |err| switch (err) {
+        error.EnvironmentVariableNotFound => {},
+        else => return err,
+    }
     if (env_map.get(key))      |v| return allocator.dupe(u8, v);
     return allocator.dupe(u8, default);
 }
@@ -142,6 +148,33 @@ test "AnthropicConfig has base_url field with default" {
 test "Config.load returns without error" {
     var cfg = try Config.load(std.testing.allocator);
     defer cfg.deinit();
+}
+
+test "dupeEnv falls back to dotenv map before default" {
+    var env_map = std.StringHashMap([]u8).init(std.testing.allocator);
+    defer {
+        var it = env_map.iterator();
+        while (it.next()) |entry| {
+            std.testing.allocator.free(entry.key_ptr.*);
+            std.testing.allocator.free(entry.value_ptr.*);
+        }
+        env_map.deinit();
+    }
+
+    try env_map.put(
+        try std.testing.allocator.dupe(u8, "JARVIS_TEST_MISSING_ENV"),
+        try std.testing.allocator.dupe(u8, "dotenv-value"),
+    );
+
+    const value = try dupeEnv(
+        std.testing.allocator,
+        "JARVIS_TEST_MISSING_ENV",
+        "default-value",
+        &env_map,
+    );
+    defer std.testing.allocator.free(value);
+
+    try std.testing.expectEqualStrings("dotenv-value", value);
 }
 
 test "loadDotEnv parses key=value pairs" {

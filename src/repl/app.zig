@@ -32,16 +32,11 @@ fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 fn printChunk(chunk: []const u8) void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, chunk) catch {};
+    std.fs.File.stdout().writeAll(chunk) catch {};
 }
 
-fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
-    var pos: usize = 0;
-    while (pos < buf.len) {
-        const n = try std.posix.write(fd, buf[pos..]);
-        if (n == 0) return error.WriteFailed;
-        pos += n;
-    }
+fn writeAll(file: std.fs.File, buf: []const u8) !void {
+    try file.writeAll(buf);
 }
 
 fn buildToolResultsJson(
@@ -95,7 +90,7 @@ fn agentLoop(
             const display = tc.input_json[0..@min(tc.input_json.len, 200)];
             const prompt = try std.fmt.allocPrint(allocator, "\x1b[33m$ {s}\x1b[0m\n", .{display});
             defer allocator.free(prompt);
-            try writeAll(std.posix.STDOUT_FILENO, prompt);
+            try writeAll(std.fs.File.stdout(), prompt);
 
             const parsed = try std.json.parseFromSlice(
                 std.json.Value, allocator, tc.input_json, .{},
@@ -112,7 +107,7 @@ fn agentLoop(
             const preview = result.output[0..@min(result.output.len, 200)];
             const out_line = try std.fmt.allocPrint(allocator, "{s}\n", .{preview});
             defer allocator.free(out_line);
-            try writeAll(std.posix.STDOUT_FILENO, out_line);
+            try writeAll(std.fs.File.stdout(), out_line);
         }
 
         const results_json = try buildToolResultsJson(allocator, response.tool_calls, results);
@@ -130,8 +125,11 @@ pub const App = struct {
     }
 
     pub fn run(self: *App) !void {
+        const stdout = std.fs.File.stdout();
+        const stdin = std.fs.File.stdin();
+
         const anthro_cfg = self.cfg.anthropic orelse {
-            try writeAll(std.posix.STDOUT_FILENO, "Error: no anthropic config\n");
+            try writeAll(stdout, "Error: no anthropic config\n");
             return;
         };
 
@@ -153,10 +151,9 @@ pub const App = struct {
 
         var line_buf: [4096]u8 = undefined;
         while (true) {
-            try writeAll(std.posix.STDOUT_FILENO, "\x1b[36mjarvis >> \x1b[0m");
+            try writeAll(stdout, "\x1b[36mjarvis >> \x1b[0m");
 
-            // Read from stdin using posix.read
-            const n = std.posix.read(std.posix.STDIN_FILENO, &line_buf) catch break;
+            const n = stdin.read(&line_buf) catch break;
             if (n == 0) break;
 
             // Find newline
@@ -170,13 +167,13 @@ pub const App = struct {
 
             try sess.append(.user, trimmed, .text);
 
-            try writeAll(std.posix.STDOUT_FILENO, "\n");
+            try writeAll(stdout, "\n");
             agentLoop(self.allocator, &sess, &provider) catch |err| {
                 const err_msg = try std.fmt.allocPrint(self.allocator, "Error: {}\n", .{err});
                 defer self.allocator.free(err_msg);
-                try writeAll(std.posix.STDOUT_FILENO, err_msg);
+                try writeAll(stdout, err_msg);
             };
-            try writeAll(std.posix.STDOUT_FILENO, "\n");
+            try writeAll(stdout, "\n");
         }
     }
 };
