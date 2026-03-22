@@ -98,8 +98,8 @@ pub fn processSseLine(
         state.current_tool_name.clearRetainingCapacity();
         state.current_input_json.clearRetainingCapacity();
         if (state.current_block_is_tool) {
-            if (cb_obj.get("id"))   |v| if (v == .string) try state.current_tool_id.appendSlice(v.string);
-            if (cb_obj.get("name")) |v| if (v == .string) try state.current_tool_name.appendSlice(v.string);
+            if (cb_obj.get("id"))   |v| if (v == .string) try state.current_tool_id.appendSlice(state.allocator, v.string);
+            if (cb_obj.get("name")) |v| if (v == .string) try state.current_tool_name.appendSlice(state.allocator, v.string);
         }
         return;
     }
@@ -115,20 +115,20 @@ pub fn processSseLine(
             const text: []const u8 = switch (delta.get("text") orelse return) {
                 .string => |s| s, else => return,
             };
-            try state.accumulated_text.appendSlice(text);
+            try state.accumulated_text.appendSlice(state.allocator, text);
             on_chunk(text, ctx);
         } else if (std.mem.eql(u8, dtype, "input_json_delta")) {
             const partial: []const u8 = switch (delta.get("partial_json") orelse return) {
                 .string => |s| s, else => return,
             };
-            try state.current_input_json.appendSlice(partial);
+            try state.current_input_json.appendSlice(state.allocator, partial);
         }
         return;
     }
 
     if (std.mem.eql(u8, event_type, "content_block_stop")) {
         if (state.current_block_is_tool) {
-            try state.tool_calls.append(.{
+            try state.tool_calls.append(state.allocator, .{
                 .id         = try state.allocator.dupe(u8, state.current_tool_id.items),
                 .name       = try state.allocator.dupe(u8, state.current_tool_name.items),
                 .input_json = try state.allocator.dupe(u8, state.current_input_json.items),
@@ -274,17 +274,85 @@ pub const Anthropic = struct {
         const url = try std.fmt.allocPrint(allocator, "{s}/v1/messages", .{self.base_url});
         defer allocator.free(url);
 
-        // TODO: Zig 0.15.2 HTTP Client API changed significantly.
-        // The old client.open() API is no longer available.
-        // Need to rewrite using client.request() and handle streaming differently.
-        // For now, return a stub response to allow compilation.
-        _ = on_chunk;
-        log.debug("anthropic send (Zig 0.15.2 API not yet implemented)", .{});
+        // Zig 0.15.2 HTTP Client implementation
+        var client = std.http.Client{ .allocator = allocator };
+        defer client.deinit();
+
+        const uri = try std.Uri.parse(url);
+        var req = try client.request(.POST, uri, .{
+            .extra_headers = &.{
+                .{ .name = "content-type",      .value = "application/json" },
+                .{ .name = "x-api-key",         .value = self.api_key },
+                .{ .name = "anthropic-version", .value = "2023-06-01" },
+            },
+        });
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = body.len };
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(body);
+        try body_writer.end();
+        try req.connection.?.flush();
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = try req.receiveHead(&redirect_buffer);
+
+        // Adapter: bridge public StreamCallback (1-arg) to internal SseCallback (2-arg)
+        const ChunkAdapter = struct {
+            public_cb: prov.StreamCallback,
+            fn forward(chunk: []const u8, ctx: *anyopaque) void {
+                const self2: *@This() = @ptrCast(@alignCast(ctx));
+                self2.public_cb(chunk);
+            }
+        };
+        var adapter = ChunkAdapter{ .public_cb = on_chunk };
+
+        var state = SseState.init(allocator);
+        errdefer state.deinit();
+
+        // Read SSE stream
+        var transfer_buffer: [64 * 1024]u8 = undefined;
+        var reader = response.reader(&transfer_buffer);
+        var line_buf: [64 * 1024]u8 = undefined;
+        var line_pos: usize = 0;
+
+        while (true) {
+            var byte_buf: [1]u8 = undefined;
+            var vecs = [_][]u8{&byte_buf};
+            const n = reader.readVec(&vecs) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => |e| return e,
+            };
+            if (n == 0) break;
+            const byte = byte_buf[0];
+
+            if (byte == '\n') {
+                const line = std.mem.trimRight(u8, line_buf[0..line_pos], "\r");
+                if (std.mem.startsWith(u8, line, "data: ")) {
+                    const data = line[6..];
+                    if (std.mem.eql(u8, data, "[DONE]")) break;
+                    try processSseLine(data, &state, ChunkAdapter.forward, &adapter);
+                }
+                line_pos = 0;
+            } else if (line_pos < line_buf.len) {
+                line_buf[line_pos] = byte;
+                line_pos += 1;
+            }
+        }
+
+        // Read stop_reason BEFORE deinit'ing state
+        const stop_reason = state.stop_reason;
+
+        const assistant_json = try buildAssistantContentJson(allocator, &state);
+        const tool_calls_slice = try state.tool_calls.toOwnedSlice(allocator);
+        // Clear tool_calls before deinit so deinit doesn't double-free
+        state.tool_calls = .empty;
+        state.deinit();
 
         return prov.LlmResponse{
-            .stop_reason            = .end_turn,
-            .tool_calls             = try allocator.alloc(prov.ToolUseBlock, 0),
-            .assistant_content_json = try allocator.dupe(u8, "[]"),
+            .stop_reason            = stop_reason,
+            .tool_calls             = tool_calls_slice,
+            .assistant_content_json = assistant_json,
             .allocator              = allocator,
         };
     }
